@@ -25,10 +25,15 @@
 #define NMEA_SHBCC_CMD              1
 #define NMEA_SHBCC_VALUE            1
 
-#define BOILER_PWR_ON   0
-#define BOILER_PWR_OFF  1
-#define LED_ON          0
-#define LED_OFF         1
+#define BOILER_PWR_ON           0
+#define BOILER_PWR_OFF          1
+#define LED_ON                  0
+#define LED_OFF                 1
+#define COMM_BLINK_TIMEOUT      1000
+#define ERROR_BLINK_TIMEOUT     500
+#define POST_BLINK_TIMEOUT      500
+#define TEMP_CRYTICAL           2500
+#define HYSTERESYS              200
 
 static const char cmd_on[] = "ON";
 static const char cmd_off[] = "OFF";
@@ -45,6 +50,8 @@ void NMEA_GetField(char *packet, uint8 field, char *result);
 
 bool check_cmd(const char *cmd);
 void blink_red(uint16 delay);
+void blink_blue(uint16 delay);
+uint16 GetTemp();
 
 CY_ISR(isr_rf)
 {    
@@ -54,12 +61,14 @@ CY_ISR(isr_rf)
     switch(NMEA_buffer[NMEA_pointer])
     {
         case NMEA_START_DELIMITER:
+        blink_blue(COMM_BLINK_TIMEOUT);
         NMEA_pointer = 0;
         break;
         
         case NMEA_END_DELIMITER:
         NMEA_handle_packet(NMEA_buffer, NMEA_SHBCC);
         NMEA_packet_received = true; 
+        Pin_LED_blue_Write(LED_OFF);
         break;
         
         default:
@@ -77,31 +86,40 @@ CY_ISR(isr_deadline)
 CY_ISR(isr_blink)
 {
     Pin_LED_red_Write(LED_OFF);
+    Pin_LED_blue_Write(LED_OFF);
     Timer_Blink_ClearInterrupt(Timer_Blink_INTR_MASK_TC);
 }
 
 int main(void)
 {    
+    bool emergency = false;
+    uint16 t;
+    
     CyGlobalIntEnable; /* Enable global interrupts. */
     UART_RF_Start();
     Timer_Deadline_Start();
     Timer_Blink_Start();
+    ADC_SAR_Seq_Temp_Start();
     
     isr_rf_StartEx(isr_rf);
     isr_deadline_StartEx(isr_deadline);
     isr_blink_StartEx(isr_blink);
     
-    blink_red(200);
-    
+    blink_red(POST_BLINK_TIMEOUT);
+    blink_blue(POST_BLINK_TIMEOUT);
+        
     for(;;)
     {
+        Control_Reg_Boiler_Write(BOILER_PWR_ON);
+        
+        //  CMD hanler
         if (NMEA_packet_received)
         {
             NMEA_packet_received = false;
             NMEA_GetField(NMEA_SHBCC, NMEA_SHBCC_CMD, cmd_buf);
             if (check_cmd(cmd_on))
             {
-                Control_Reg_Boiler_Write(!Control_Reg_Boiler_Read());
+                Control_Reg_Boiler_Write(BOILER_PWR_ON);
             }
             if (check_cmd(cmd_off))
             {
@@ -111,7 +129,38 @@ int main(void)
             NMEA_SHBCC[0] = 0;
             strlcat(NMEA_SHBCC, nmea_shbcc_empty, NMEA_MAX_SIZE);
         }
+        
+        // Check if crytical temp reached
+        if ((Control_Reg_Boiler_Read() == BOILER_PWR_OFF) || emergency)
+        {
+            t = GetTemp();
+            if(t < TEMP_CRYTICAL) emergency = true;
+            if(t > TEMP_CRYTICAL + HYSTERESYS) emergency = false;
+            if(emergency)
+            {
+                Control_Reg_Boiler_Write(BOILER_PWR_ON);
+                Pin_LED_red_Write(LED_ON);
+            }
+            else
+            {
+                Control_Reg_Boiler_Write(BOILER_PWR_OFF);
+                Pin_LED_red_Write(LED_OFF);
+            }
+        }
     }
+}
+
+uint16 GetTemp()
+{
+    uint16 v;
+    uint32 r;
+    
+    ADC_SAR_Seq_Temp_StartConvert();
+    ADC_SAR_Seq_Temp_IsEndConversion(ADC_SAR_Seq_Temp_WAIT_FOR_RESULT);
+    v = ADC_SAR_Seq_Temp_GetResult16(0);
+    ADC_SAR_Seq_Temp_StopConvert();
+    r = Thermistor_GetResistance(ADC_SAR_Seq_Temp_DEFAULT_HIGH_LIMIT - v, v);
+    return Thermistor_GetTemperature(r);
 }
 
 void blink_red(uint16 delay)
@@ -120,7 +169,13 @@ void blink_red(uint16 delay)
     Timer_Blink_WritePeriod(delay);
     Timer_Blink_Start();
 }
-    
+
+void blink_blue(uint16 delay)
+{
+    Pin_LED_blue_Write(LED_ON);
+    Timer_Blink_WritePeriod(delay);
+    Timer_Blink_Start();
+}
 
 bool check_cmd(const char *cmd)
 {
@@ -152,7 +207,7 @@ void NMEA_handle_packet(char *packet, char *NMEA_data)
     uint8 i, n;
     uint8 error = 0;
     uint8 checksum = 0;
-    char *packet_checksum;
+    char *checksum_delimiter;
     char calculated_checksum[3];
         
     // Check if appropriate packet is handled
@@ -173,22 +228,22 @@ void NMEA_handle_packet(char *packet, char *NMEA_data)
         if (!error)
         {
             // Find checksum field
-            packet_checksum = memchr(packet, NMEA_CHECKSUM_DELIMITER, NMEA_MAX_SIZE) + 1;
-            i = (uint8)(packet_checksum - packet);
-            // Cut string to NMEA_CHECKSUM_DELIMITER
-            packet[i-1] = 0;
+            checksum_delimiter = memchr(packet, NMEA_CHECKSUM_DELIMITER, NMEA_MAX_SIZE);
+            i = (uint8)(checksum_delimiter - packet);
             
             // Calculate checksum and compare
             for (n = 0; n < i; n++) checksum ^= packet[n];
             itoa(checksum, calculated_checksum, 16);
-            if(!strcmp(calculated_checksum, packet_checksum)) error++;
+            
+            packet[i] = 0; // Cut string to NMEA_CHECKSUM_DELIMITER
+            if(strncmp(calculated_checksum, checksum_delimiter + 1, sizeof(calculated_checksum) - 1)) error++;
         }   
         
         // Copy buffer to NMEA packet if no errors found
         if (!error) strlcpy(NMEA_data, packet, NMEA_MAX_SIZE);
         
         // Blink red if receive errors occured
-        if(error) blink_red(200);
+        if(error) blink_red(ERROR_BLINK_TIMEOUT);
     }
 }
 
